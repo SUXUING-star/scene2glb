@@ -7,11 +7,18 @@ import numpy as np
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".tif", ".tiff", ".webp"}
 
+FORMAT_TO_EXT = {
+    "PNG": ".png",
+    "JPEG": ".jpg",
+    "TARGA": ".tga",
+    "TARGA_RAW": ".tga",
+    "BMP": ".bmp",
+    "TIFF": ".tif",
+    "WEBP": ".webp",
+}
+
 
 def scan_texture_directory(search_root: str):
-    """
-    递归扫描目录下的所有贴图文件，建立精确文件名 / 去后缀名索引
-    """
     by_filename = {}
     by_stem = {}
     skip_dirs = {"output_glb", "_tex_cache", ".git", "__pycache__"}
@@ -38,24 +45,55 @@ def _strip_blender_suffix(name: str) -> str:
     return re.sub(r"\.\d{3}$", "", name)
 
 
-def relink_missing_textures(search_root: str):
+def resolve_packed_or_external_images(search_root: str, cache_dir: str):
     """
-    自动扫描本地贴图文件夹并重连所有丢失/未打包的 Blender Image 数据块
+    同时处理：
+    1) 直接打包在 .blend 内部的贴图 (packed_file) —— 若未解码则安全解出字节流加载
+    2) 外部路径丢失的贴图 —— 扫描本地目录自动重连
     """
     by_filename, by_stem = scan_texture_directory(search_root)
-    if not by_filename:
-        print(f"  [贴图扫描] 目录 {search_root} 下未发现外部贴图文件")
-        return
+    unpack_dir = os.path.join(cache_dir, "_unpacked")
 
+    packed_count = 0
+    external_ok = 0
     relinked_count = 0
-    for img in bpy.data.images:
+
+    for img in list(bpy.data.images):
+        if img.source == "GENERATED":
+            external_ok += 1
+            continue
         if img.source not in {"FILE", "SEQUENCE"}:
             continue
 
-        # 已有打包数据或原路径有效且可读取，直接跳过
-        abs_fp = bpy.path.abspath(img.filepath) if img.filepath else ""
-        if img.packed_file is not None and img.size[0] > 0:
+        # 情况 A：贴图直接打包在 .blend 里面
+        if img.packed_file is not None:
+            packed_count += 1
+            if img.size[0] == 0 or img.size[1] == 0:
+                # 不能对 packed_file 调 reload()（外部路径不存在会失败），直接写字节流到缓存加载
+                os.makedirs(unpack_dir, exist_ok=True)
+                ext = FORMAT_TO_EXT.get(getattr(img, "file_format", "PNG"), ".png")
+                if img.filepath:
+                    fp_ext = os.path.splitext(img.filepath.replace("\\", "/"))[
+                        1
+                    ].lower()
+                    if fp_ext in IMAGE_EXTS:
+                        ext = fp_ext
+                safe = "".join(
+                    c if c.isalnum() or c in "_-" else "_" for c in img.name
+                )[:40]
+                tmp_path = os.path.join(unpack_dir, f"{safe}{ext}")
+                with open(tmp_path, "wb") as f:
+                    f.write(img.packed_file.data)
+                img.filepath = tmp_path
+                try:
+                    img.unpack(method="REMOVE")
+                except Exception:
+                    pass
+                img.reload()
             continue
+
+        # 情况 B：外部贴图路径有效
+        abs_fp = bpy.path.abspath(img.filepath) if img.filepath else ""
         if abs_fp and os.path.isfile(abs_fp):
             if img.size[0] == 0:
                 try:
@@ -63,9 +101,13 @@ def relink_missing_textures(search_root: str):
                 except Exception:
                     pass
             if img.size[0] > 0:
+                external_ok += 1
                 continue
 
-        # 提取候选文件名（兼容 Windows 反斜杠和 Blender .001 后缀）
+        # 情况 C：外部路径失效 -> 扫描本地目录自动重连
+        if not by_filename:
+            continue
+
         candidates = []
         if img.filepath:
             norm = img.filepath.replace("\\", "/")
@@ -97,18 +139,22 @@ def relink_missing_textures(search_root: str):
                 print(f"  [贴图警告] 加载失败 {matched}: {e}")
 
     print(
-        f"  [贴图扫描] 扫描到 {sum(len(v) for v in by_filename.values())} 张本地贴图，重连 {relinked_count} 张"
+        f"  [贴图统计] .blend内嵌打包: {packed_count} 张 | "
+        f"本地有效: {external_ok} 张 | 扫描重连: {relinked_count} 张"
     )
 
 
 def ensure_image_loaded(img: bpy.types.Image) -> bool:
     if img is None:
         return False
+    if img.source == "GENERATED":
+        return img.size[0] > 0 and img.size[1] > 0
     if img.size[0] == 0 or img.size[1] == 0:
-        try:
-            img.reload()
-        except Exception:
-            return False
+        if img.packed_file is None:
+            try:
+                img.reload()
+            except Exception:
+                return False
     return img.size[0] > 0 and img.size[1] > 0
 
 
@@ -149,6 +195,7 @@ def bake_tint_and_convert_png(
     cache_dir: str,
     max_size: int = 2048,
     suffix: str = "",
+    alpha_mask_img: bpy.types.Image = None,
 ):
     os.makedirs(cache_dir, exist_ok=True)
     tint = np.array(
@@ -167,11 +214,22 @@ def bake_tint_and_convert_png(
     h, w, _ = rgba.shape
     src_format = getattr(img, "file_format", "PNG")
     need_resize = max(w, h) > max_size
+    need_alpha_merge = alpha_mask_img is not None and alpha_mask_img != img
 
-    if src_format == "PNG" and not need_tint and not need_resize and img.packed_file:
+    # 若已经是打包好的 PNG 且无需改色/缩放/合并Alpha，直接复用（注意低模若需缩放则不走这里）
+    if (
+        img.source != "GENERATED"
+        and src_format == "PNG"
+        and not need_tint
+        and not need_resize
+        and not need_alpha_merge
+        and img.packed_file is not None
+        and suffix == ""
+    ):
         return img
 
-    key_str = f"{img.name}|{w}x{h}|{tint.tolist()}|{max_size}|{suffix}"
+    mask_key = alpha_mask_img.name if need_alpha_merge else ""
+    key_str = f"{img.name}|{w}x{h}|{tint.tolist()}|{max_size}|{suffix}|{mask_key}"
     digest = hashlib.md5(key_str.encode("utf-8")).hexdigest()[:10]
     safe_base = "".join(
         c if c.isalnum() or c in "_-" else "_" for c in os.path.splitext(img.name)[0]
@@ -183,12 +241,23 @@ def bake_tint_and_convert_png(
         return bpy.data.images[out_name]
 
     if not os.path.exists(out_path):
-        # 新建独立图像对象，避免 packed_file 只读导致 save() 报错
+        pixels = rgba.copy()
+        if need_alpha_merge:
+            mask_rgba = get_image_pixels_rgba(alpha_mask_img)
+            if mask_rgba is not None and mask_rgba.shape[:2] == pixels.shape[:2]:
+                # 兼容灰度图（读 R 通道或 A 通道）
+                pixels[:, :, 3] = (
+                    mask_rgba[:, :, 3]
+                    if mask_rgba[:, :, 3].min() < 0.99
+                    else mask_rgba[:, :, 0]
+                )
+        if need_tint:
+            pixels = np.clip(pixels * tint, 0.0, 1.0)
+
         work_img = bpy.data.images.new(
             f"__tmp_{out_name}", width=w, height=h, alpha=True
         )
         try:
-            pixels = np.clip(rgba * tint, 0.0, 1.0) if need_tint else rgba
             work_img.pixels.foreach_set(pixels.ravel())
             work_img.update()
 
