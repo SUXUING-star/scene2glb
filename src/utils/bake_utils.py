@@ -257,10 +257,10 @@ def _set_active_bake_image_node(mat, img):
     return tex_node
 
 
-def _save_image_to_png(img: bpy.types.Image, out_path: str):
+def _save_image_file(img: bpy.types.Image, out_path: str, file_format: str = "PNG"):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     img.filepath_raw = out_path
-    img.file_format = "PNG"
+    img.file_format = file_format
     img.save()
 
 
@@ -308,7 +308,6 @@ def bake_object_materials(
     alpha_baked_mats = set()
     results = {}
 
-    # 为非目标槽准备占位材质 + 占位图，防止 Cycles 误覆盖原有贴图或报错
     dummy_img = bpy.data.images.new("__bake_dummy_skip", width=8, height=8, alpha=False)
     dummy_mat = bpy.data.materials.new("__bake_dummy_mat")
     dummy_mat.use_nodes = True
@@ -428,10 +427,15 @@ def bake_object_materials(
             tag = hashlib.md5(
                 f"{obj.name}|{mat.name}|{res}".encode("utf-8")
             ).hexdigest()[:8]
-            base_path = os.path.join(cache_dir, f"baked_{safe}_{tag}.png")
-            emit_path = os.path.join(cache_dir, f"baked_{safe}_{tag}_em.png")
 
-            _save_image_to_png(base_img, base_path)
+            has_alpha = float(base_rgba[:, :, 3].min()) < 0.99
+            base_ext = ".png" if has_alpha else ".jpg"
+            base_fmt = "PNG" if has_alpha else "JPEG"
+
+            base_path = os.path.join(cache_dir, f"baked_{safe}_{tag}{base_ext}")
+            emit_path = os.path.join(cache_dir, f"baked_{safe}_{tag}_em.jpg")
+
+            _save_image_file(base_img, base_path, base_fmt)
 
             has_emission = False
             if (
@@ -440,7 +444,7 @@ def bake_object_materials(
                 and not is_pure_emit
             ):
                 has_emission = True
-                _save_image_to_png(emit_img, emit_path)
+                _save_image_file(emit_img, emit_path, "JPEG")
 
             for tmp_im in (base_img, emit_img, alpha_img):
                 if tmp_im.name in bpy.data.images:

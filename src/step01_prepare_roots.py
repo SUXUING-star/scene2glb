@@ -32,6 +32,8 @@ def run(config: dict) -> bpy.types.Object:
         if obj.type in {"MESH", "ARMATURE"}:
             scene_utils.ensure_object_visible_and_linked(obj)
 
+    bpy.context.view_layer.update()
+
     # 查找或新建唯一英文根节点
     master_root = bpy.data.objects.get(en_name)
     if master_root is not None and master_root.type != "EMPTY":
@@ -74,6 +76,37 @@ def run(config: dict) -> bpy.types.Object:
     ]
     for obj in top_objects:
         scene_utils.reparent_keep_world(obj, master_root)
+
+    # 2.5 清理静态场景虚拟骨架，以及解绑真实骨架下无蒙皮权重的普通网格
+    all_objs = list(scene_utils.iter_hierarchy(master_root))
+    armatures = [o for o in all_objs if o.type == "ARMATURE"]
+    for arm_obj in armatures:
+        if not scene_utils.is_armature_actually_used(arm_obj, all_objs):
+            print(
+                f"  检测到静态场景虚拟骨架 {arm_obj.name}（无蒙皮权重/动画），正在解绑并移除..."
+            )
+            bpy.context.view_layer.update()
+            for child in list(arm_obj.children):
+                scene_utils.reparent_keep_world(child, master_root)
+            for obj in all_objs:
+                if obj.type == "MESH":
+                    for mod in list(obj.modifiers):
+                        if mod.type == "ARMATURE" and mod.object == arm_obj:
+                            obj.modifiers.remove(mod)
+            if arm_obj.name in bpy.data.objects:
+                bpy.data.objects.remove(arm_obj, do_unlink=True)
+        else:
+            bpy.context.view_layer.update()
+            for child in list(arm_obj.children):
+                if (
+                    child.type == "MESH"
+                    and child.parent_type == "OBJECT"
+                    and not scene_utils.mesh_has_skinning(child, arm_obj)
+                ):
+                    scene_utils.reparent_keep_world(child, master_root)
+                    for mod in list(child.modifiers):
+                        if mod.type == "ARMATURE" and mod.object == arm_obj:
+                            child.modifiers.remove(mod)
 
     # 3. 统一将子级命名为英文并去重
     used_names = {master_root.name}

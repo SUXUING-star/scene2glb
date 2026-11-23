@@ -69,7 +69,6 @@ def resolve_packed_or_external_images(search_root: str, cache_dir: str):
         if img.packed_file is not None:
             packed_count += 1
             if img.size[0] == 0 or img.size[1] == 0:
-                # 不能对 packed_file 调 reload()（外部路径不存在会失败），直接写字节流到缓存加载
                 os.makedirs(unpack_dir, exist_ok=True)
                 ext = FORMAT_TO_EXT.get(getattr(img, "file_format", "PNG"), ".png")
                 if img.filepath:
@@ -216,10 +215,22 @@ def bake_tint_and_convert_png(
     need_resize = max(w, h) > max_size
     need_alpha_merge = alpha_mask_img is not None and alpha_mask_img != img
 
-    # 若已经是打包好的 PNG 且无需改色/缩放/合并Alpha，直接复用（注意低模若需缩放则不走这里）
+    # 判断最终图像是否需要 Alpha 通道；法线贴图(_nrm)强制用 PNG 避免 JPEG 压缩噪点
+    has_alpha = float(rgba[:, :, 3].min()) < 0.99 or material_alpha < 0.98
+    if need_alpha_merge:
+        mask_rgba = get_image_pixels_rgba(alpha_mask_img)
+        if mask_rgba is not None and mask_rgba.shape[:2] == rgba.shape[:2]:
+            has_alpha = True
+    else:
+        mask_rgba = None
+
+    use_png = has_alpha or suffix == "_nrm"
+    out_ext = ".png" if use_png else ".jpg"
+    out_fmt = "PNG" if use_png else "JPEG"
+
     if (
         img.source != "GENERATED"
-        and src_format == "PNG"
+        and src_format == out_fmt
         and not need_tint
         and not need_resize
         and not need_alpha_merge
@@ -229,12 +240,14 @@ def bake_tint_and_convert_png(
         return img
 
     mask_key = alpha_mask_img.name if need_alpha_merge else ""
-    key_str = f"{img.name}|{w}x{h}|{tint.tolist()}|{max_size}|{suffix}|{mask_key}"
+    key_str = (
+        f"{img.name}|{w}x{h}|{tint.tolist()}|{max_size}|{suffix}|{mask_key}|{out_fmt}"
+    )
     digest = hashlib.md5(key_str.encode("utf-8")).hexdigest()[:10]
     safe_base = "".join(
         c if c.isalnum() or c in "_-" else "_" for c in os.path.splitext(img.name)[0]
     )[:32]
-    out_name = f"{safe_base}_{digest}{suffix}.png"
+    out_name = f"{safe_base}_{digest}{suffix}{out_ext}"
     out_path = os.path.join(cache_dir, out_name)
 
     if out_name in bpy.data.images and bpy.data.images[out_name].size[0] > 0:
@@ -242,20 +255,17 @@ def bake_tint_and_convert_png(
 
     if not os.path.exists(out_path):
         pixels = rgba.copy()
-        if need_alpha_merge:
-            mask_rgba = get_image_pixels_rgba(alpha_mask_img)
-            if mask_rgba is not None and mask_rgba.shape[:2] == pixels.shape[:2]:
-                # 兼容灰度图（读 R 通道或 A 通道）
-                pixels[:, :, 3] = (
-                    mask_rgba[:, :, 3]
-                    if mask_rgba[:, :, 3].min() < 0.99
-                    else mask_rgba[:, :, 0]
-                )
+        if need_alpha_merge and mask_rgba is not None:
+            pixels[:, :, 3] = (
+                mask_rgba[:, :, 3]
+                if mask_rgba[:, :, 3].min() < 0.99
+                else mask_rgba[:, :, 0]
+            )
         if need_tint:
             pixels = np.clip(pixels * tint, 0.0, 1.0)
 
         work_img = bpy.data.images.new(
-            f"__tmp_{out_name}", width=w, height=h, alpha=True
+            f"__tmp_{out_name}", width=w, height=h, alpha=use_png
         )
         try:
             work_img.pixels.foreach_set(pixels.ravel())
@@ -268,7 +278,7 @@ def bake_tint_and_convert_png(
                 work_img.scale(new_w, new_h)
 
             work_img.filepath_raw = out_path
-            work_img.file_format = "PNG"
+            work_img.file_format = out_fmt
             work_img.save()
         finally:
             bpy.data.images.remove(work_img)

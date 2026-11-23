@@ -22,7 +22,7 @@ def _select_multiple_hierarchies(roots):
         bpy.context.view_layer.objects.active = roots[0]
 
 
-def _export_selected_to_glb(roots, filepath: str):
+def _export_selected_to_glb(roots, filepath: str, config: dict):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     _select_multiple_hierarchies(roots)
 
@@ -31,6 +31,7 @@ def _export_selected_to_glb(roots, filepath: str):
         raise RuntimeError(f"导出前校验失败：没有选中的 Mesh，终止导出！({filepath})")
 
     has_armature = any(o.type == "ARMATURE" for o in bpy.context.selected_objects)
+    use_draco = bool(config.get("use_draco", True))
 
     desired_kwargs = {
         "filepath": filepath,
@@ -46,6 +47,8 @@ def _export_selected_to_glb(roots, filepath: str):
         "export_animations": has_armature,
         "export_def_bones": True,
         "export_extras": True,
+        "export_draco_mesh_compression_enable": use_draco,
+        "export_draco_mesh_compression_level": int(config.get("draco_level", 6)),
     }
 
     valid_props = set(bpy.ops.export_scene.gltf.get_rna_type().properties.keys())
@@ -70,17 +73,15 @@ def run(
     pack_lowpoly = bool(config.get("pack_lowpoly", True))
 
     if pack_lowpoly:
-        # 打包进同一个 GLB 文件（不拆成两个模型）
         packed_glb = os.path.join(output_dir, f"{root_obj.name}.glb")
-        print(f"  模式: pack_lowpoly=True -> 标准模型与低模打包至同一文件")
-        _export_selected_to_glb([root_obj, low_root], packed_glb)
+        print("  模式: pack_lowpoly=True -> 标准模型与低模打包至同一文件")
+        _export_selected_to_glb([root_obj, low_root], packed_glb, config)
     else:
-        # 分别导出两个 GLB 文件
-        print(f"  模式: pack_lowpoly=False -> 分别导出标准 GLB 与低模 GLB")
+        print("  模式: pack_lowpoly=False -> 分别导出标准 GLB 与低模 GLB")
         main_glb = os.path.join(output_dir, f"{root_obj.name}.glb")
         low_glb = os.path.join(output_dir, f"{root_obj.name}_lowpoly.glb")
-        _export_selected_to_glb([root_obj], main_glb)
-        _export_selected_to_glb([low_root], low_glb)
+        _export_selected_to_glb([root_obj], main_glb, config)
+        _export_selected_to_glb([low_root], low_glb, config)
 
     if low_root is not None and not config.get("keep_lowpoly_in_scene", False):
         scene_utils.delete_object_tree(low_root)

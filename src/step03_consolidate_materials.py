@@ -89,6 +89,7 @@ def _rebuild_standard_principled(
     nt.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
 
     tint = info["tint_color"]
+    tex_node = None
     if base_img is not None:
         tex_node = nt.nodes.new("ShaderNodeTexImage")
         tex_node.location = (-400, 120)
@@ -116,12 +117,15 @@ def _rebuild_standard_principled(
             bsdf, ["Emission Strength"], min(info["emission_strength"], 10.0)
         )
         if emission_img is not None:
-            em_node = nt.nodes.new("ShaderNodeTexImage")
-            em_node.location = (-400, -180)
-            em_node.image = emission_img
             em_sock = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
             if em_sock:
-                nt.links.new(em_node.outputs["Color"], em_sock)
+                if emission_img == base_img and tex_node is not None:
+                    nt.links.new(tex_node.outputs["Color"], em_sock)
+                else:
+                    em_node = nt.nodes.new("ShaderNodeTexImage")
+                    em_node.location = (-400, -180)
+                    em_node.image = emission_img
+                    nt.links.new(em_node.outputs["Color"], em_sock)
         else:
             scene_utils.set_principled_input(
                 bsdf, ["Emission Color", "Emission"], info["emission_color"]

@@ -83,10 +83,39 @@ def iter_hierarchy(root_obj):
 def reparent_keep_world(obj, new_parent):
     if obj == new_parent:
         return
+    bpy.context.view_layer.update()
     world_mat = obj.matrix_world.copy()
     obj.parent = new_parent
     obj.matrix_parent_inverse = new_parent.matrix_world.inverted()
     obj.matrix_world = world_mat
+
+
+def mesh_has_skinning(mesh_obj, arm_obj=None) -> bool:
+    if mesh_obj.type != "MESH" or not mesh_obj.vertex_groups:
+        return False
+    for mod in mesh_obj.modifiers:
+        if mod.type == "ARMATURE" and mod.object is not None:
+            if arm_obj is not None and mod.object != arm_obj:
+                continue
+            target_arm = mod.object
+            if target_arm.type == "ARMATURE" and target_arm.data:
+                bone_names = {b.name for b in target_arm.data.bones}
+                if any(vg.name in bone_names for vg in mesh_obj.vertex_groups):
+                    return True
+    return False
+
+
+def is_armature_actually_used(arm_obj, hierarchy_objects) -> bool:
+    if arm_obj.type != "ARMATURE":
+        return False
+    if arm_obj.animation_data and arm_obj.animation_data.action:
+        return True
+    for obj in hierarchy_objects:
+        if obj.parent == arm_obj and obj.parent_type == "BONE":
+            return True
+        if obj.type == "MESH" and mesh_has_skinning(obj, arm_obj):
+            return True
+    return False
 
 
 def delete_object_tree(obj):
