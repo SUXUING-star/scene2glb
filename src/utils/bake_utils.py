@@ -7,11 +7,8 @@ import numpy as np
 
 from . import scene_utils, texture_utils
 
-PROCEDURAL_OR_COMPLEX_NODES = {
-    "MIX",
-    "MIX_RGB",
-    "MIX_SHADER",
-    "VALTORGB",  # ColorRamp
+# 必须通过 Cycles Bake 才能保留效果的程序化 / 复合节点类型
+COMPLEX_BAKE_NODES = {
     "TEX_NOISE",
     "TEX_VORONOI",
     "TEX_WAVE",
@@ -20,22 +17,17 @@ PROCEDURAL_OR_COMPLEX_NODES = {
     "TEX_CHECKER",
     "TEX_MAGIC",
     "TEX_BRICK",
-    "AMBIENT_OCCLUSION",
-    "FRESNEL",
-    "LAYER_WEIGHT",
-    "ATTRIBUTE",
-    "VERTEX_COLOR",
-    "SHADERTORGB",
-    "MAP_RANGE",
-    "MATH",
-    "VECT_MATH",
+    "VALTORGB",
+    "MIX",
+    "MIX_RGB",
     "HUE_SAT",
     "BRIGHTCONTRAST",
-    "GAMMA",
-    "RGBTOBW",
     "CURVE_RGB",
-    "GROUP",
-    "BUMP",
+    "SHADERTORGB",
+    "ATTRIBUTE",
+    "VERTEX_COLOR",
+    "AMBIENT_OCCLUSION",
+    "NEW_GEOMETRY",
 }
 
 
@@ -51,23 +43,6 @@ def _iter_all_nodes(node_tree, visited=None):
         yield n
         if n.type == "GROUP" and n.node_tree:
             yield from _iter_all_nodes(n.node_tree, visited)
-
-
-def needs_cycles_bake(mat: bpy.types.Material, bake_mode: str = "auto") -> bool:
-    if bake_mode in ("all", "combined"):
-        return True
-    if not mat or not mat.use_nodes or not mat.node_tree:
-        return False
-    for node in _iter_all_nodes(mat.node_tree):
-        if (
-            node.type == "GROUP"
-            and node.node_tree
-            and "mmd_shader" in node.node_tree.name.lower()
-        ):
-            continue
-        if node.type in PROCEDURAL_OR_COMPLEX_NODES:
-            return True
-    return False
 
 
 def uses_position_dependent_coords(mat: bpy.types.Material) -> bool:
@@ -90,12 +65,66 @@ def uses_position_dependent_coords(mat: bpy.types.Material) -> bool:
     return False
 
 
+def needs_cycles_bake(mat: bpy.types.Material, bake_mode: str = "auto") -> bool:
+    """
+    智能判断是否需要启动 Cycles Bake:
+    - 'none': 绝不烘焙
+    - 'all' / 'combined': 强制全部烘焙
+    - 'auto': 若属于 mmd_tools 原生材质，不走 Bake（保留底图）；
+              否则若使用程序化节点、ColorRamp、混色节点、ShaderToRGB、顶点色或非 UV 坐标时走 Bake。
+    """
+    if bake_mode in ("none", "false", "off"):
+        return False
+    if bake_mode in ("all", "combined"):
+        return True
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return False
+
+    # mmd_tools 自带材质直接走底图提取，避免把 toon 阴影烘死到固有色
+    if mat.node_tree.nodes.get("mmd_base_tex") is not None:
+        return False
+
+    all_nodes = list(_iter_all_nodes(mat.node_tree))
+    for node in all_nodes:
+        if node.type in COMPLEX_BAKE_NODES:
+            return True
+
+    if uses_position_dependent_coords(mat):
+        return True
+
+    # 多个贴图同时存在且无简单映射时，或使用了 MixShader(非纯Transparent)
+    tex_nodes = [n for n in all_nodes if n.type == "TEX_IMAGE" and n.image is not None]
+    for node in all_nodes:
+        if node.type == "MIX_SHADER":
+            s1 = node.inputs[1].links[0].from_node if node.inputs[1].is_linked else None
+            s2 = node.inputs[2].links[0].from_node if node.inputs[2].is_linked else None
+            has_trans = (s1 and s1.type == "BSDF_TRANSPARENT") or (
+                s2 and s2.type == "BSDF_TRANSPARENT"
+            )
+            if not has_trans and len(tex_nodes) > 0:
+                return True
+
+    return False
+
+
+def _has_out_of_bounds_uv(mesh: bpy.types.Mesh) -> bool:
+    if len(mesh.uv_layers) == 0:
+        return True
+    uv_layer = mesh.uv_layers.active or mesh.uv_layers[0]
+    if not uv_layer or len(uv_layer.data) == 0:
+        return True
+    for loop_uv in uv_layer.data:
+        u, v = loop_uv.uv[0], loop_uv.uv[1]
+        if u < -0.02 or u > 1.02 or v < -0.02 or v > 1.02:
+            return True
+    return False
+
+
 def _ensure_bakeable_visibility_and_check_eval(obj: bpy.types.Object) -> bool:
-    """确保对象及所在集合渲染可见，且评估后的几何体确实有面"""
     scene_utils.enable_all_collections_in_view_layer()
     for col in obj.users_collection:
-        col.hide_viewport = False
-        col.hide_render = False
+        if not getattr(col, "hide_render", False):
+            col.hide_viewport = False
 
     scene_utils.ensure_object_visible_and_linked(obj)
     obj.hide_render = False
@@ -113,28 +142,61 @@ def _ensure_bakeable_visibility_and_check_eval(obj: bpy.types.Object) -> bool:
     return poly_count > 0
 
 
-def ensure_bake_uv(obj: bpy.types.Object, force_reunwrap: bool = False):
+def ensure_bake_uv(obj: bpy.types.Object, force_new_uv: bool = False):
+    """
+    确保对象可用于烘焙。
+    如果原来已有 UV 且因空间坐标/越界平铺需要重展，则在新建的 `__BakeUV` 上展开，
+    并返回 (ok, uv_name_to_use, prev_active_uv_name, prev_render_uv_name)，避免破坏其他未烘焙材质的 UV！
+    """
     mesh = obj.data
     if len(mesh.polygons) == 0:
-        return
-    if len(mesh.uv_layers) > 0 and not force_reunwrap:
-        return
+        return False, None, None, None
 
-    uv_name = "__BakeUV"
-    uv_layer = mesh.uv_layers.get(uv_name) or mesh.uv_layers.new(name=uv_name)
+    prev_active = mesh.uv_layers.active.name if mesh.uv_layers.active else None
+    prev_render = next(
+        (uv.name for uv in mesh.uv_layers if uv.active_render), prev_active
+    )
+
+    if len(mesh.uv_layers) > 0 and not force_new_uv:
+        return True, prev_active, prev_active, prev_render
+
+    uv_name = "__BakeUV" if len(mesh.uv_layers) > 0 else "UVMap"
+    uv_layer = mesh.uv_layers.get(uv_name)
+    if uv_layer is None:
+        try:
+            uv_layer = mesh.uv_layers.new(name=uv_name)
+        except Exception:
+            uv_layer = None
+
+    if uv_layer is None:
+        if len(mesh.uv_layers) > 0:
+            uv_layer = mesh.uv_layers.active or mesh.uv_layers[0]
+            return True, uv_layer.name, prev_active, prev_render
+        return False, None, None, None
+
     mesh.uv_layers.active = uv_layer
     uv_layer.active_render = True
 
+    scene_utils.ensure_object_visible_and_linked(obj)
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
 
-    bpy.ops.object.mode_set(mode="EDIT")
-    try:
-        bpy.ops.mesh.select_all(action="SELECT")
-        bpy.ops.uv.smart_project(angle_limit=math.radians(66.0), island_margin=0.02)
-    finally:
-        bpy.ops.object.mode_set(mode="OBJECT")
+    with bpy.context.temp_override(
+        active_object=obj,
+        selected_objects=[obj],
+        selected_editable_objects=[obj],
+    ):
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.uv.smart_project(angle_limit=math.radians(66.0), island_margin=0.02)
+        except Exception:
+            return False, None, prev_active, prev_render
+        finally:
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+    return True, uv_layer.name, prev_active, prev_render
 
 
 def _bypass_shader_to_rgb(node_tree):
@@ -275,7 +337,18 @@ def bake_object_materials(
         return {}
 
     if not _ensure_bakeable_visibility_and_check_eval(obj):
-        print(f"  [Bake跳过] {obj.name}: 评估面数为 0 或对象不在当前视图层，跳过烘焙")
+        return {}
+
+    need_new_uv = len(obj.data.uv_layers) == 0 or (
+        (
+            any(uses_position_dependent_coords(m) for m in target_mats)
+            or _has_out_of_bounds_uv(obj.data)
+        )
+    )
+    ok, bake_uv_name, prev_active_uv, prev_render_uv = ensure_bake_uv(
+        obj, force_new_uv=need_new_uv
+    )
+    if not ok:
         return {}
 
     scene = bpy.context.scene
@@ -285,20 +358,15 @@ def bake_object_materials(
     prev_device = scene.cycles.device
 
     scene.render.engine = "CYCLES"
-    scene.cycles.samples = 16 if bake_mode == "combined" else 4
+    scene.cycles.samples = 4 if bake_mode == "combined" else 1
     scene.cycles.use_denoising = False
-    scene.cycles.max_bounces = 4 if bake_mode == "combined" else 2
+    scene.cycles.max_bounces = 2
     try:
         prefs = bpy.context.preferences.addons["cycles"].preferences
         if prefs.compute_device_type != "NONE":
             scene.cycles.device = "GPU"
     except Exception:
         scene.cycles.device = "CPU"
-
-    need_reunwrap = len(obj.data.uv_layers) == 0 or any(
-        uses_position_dependent_coords(m) for m in target_mats
-    )
-    ensure_bake_uv(obj, force_reunwrap=need_reunwrap)
 
     orig_slots = [slot.material for slot in obj.material_slots]
     target_set = set(target_mats)
@@ -317,11 +385,15 @@ def bake_object_materials(
     try:
         for mat in target_mats:
             tag = hashlib.md5(
-                f"{obj.name}|{mat.name}|{res}|{bake_mode}".encode("utf-8")
+                f"{obj.name}|{mat.name}|{res}".encode("utf-8")
             ).hexdigest()[:8]
-            safe = "".join(c if c.isalnum() or c in "_-" else "_" for c in mat.name)[
-                :28
-            ]
+            safe = (
+                "".join(
+                    c if c.isascii() and (c.isalnum() or c in "_-") else "_"
+                    for c in mat.name
+                ).strip("_")[:24]
+                or "mat"
+            )
 
             base_img = bpy.data.images.new(
                 f"__bake_{safe}_{tag}_base", width=res, height=res, alpha=True
@@ -332,7 +404,7 @@ def bake_object_materials(
             alpha_img = bpy.data.images.new(
                 f"__bake_{safe}_{tag}_alpha", width=res, height=res, alpha=False
             )
-            bake_images[mat.name] = (base_img, emit_img, alpha_img)
+            bake_images[mat] = (base_img, emit_img, alpha_img)
 
         def _run_bake(bake_type: str, **kwargs):
             bpy.ops.object.select_all(action="DESELECT")
@@ -343,14 +415,25 @@ def bake_object_materials(
                 selected_objects=[obj],
                 selected_editable_objects=[obj],
             ):
-                bpy.ops.object.bake(type=bake_type, margin=8, use_clear=True, **kwargs)
+                try:
+                    bpy.ops.object.bake(
+                        type=bake_type, margin=4, use_clear=True, **kwargs
+                    )
+                except RuntimeError:
+                    if scene.cycles.device != "CPU":
+                        scene.cycles.device = "CPU"
+                        bpy.ops.object.bake(
+                            type=bake_type, margin=4, use_clear=True, **kwargs
+                        )
+                    else:
+                        raise
 
         if bake_mode == "combined":
             for idx, orig_mat in enumerate(orig_slots):
                 if orig_mat in target_set:
                     b_mat = orig_mat.copy()
                     temp_mats.append(b_mat)
-                    _set_active_bake_image_node(b_mat, bake_images[orig_mat.name][0])
+                    _set_active_bake_image_node(b_mat, bake_images[orig_mat][0])
                     obj.material_slots[idx].material = b_mat
                 else:
                     obj.material_slots[idx].material = dummy_mat
@@ -362,7 +445,7 @@ def bake_object_materials(
                     b_mat = orig_mat.copy()
                     temp_mats.append(b_mat)
                     _prepare_albedo_bake_material(b_mat)
-                    _set_active_bake_image_node(b_mat, bake_images[orig_mat.name][0])
+                    _set_active_bake_image_node(b_mat, bake_images[orig_mat][0])
                     obj.material_slots[idx].material = b_mat
                 else:
                     obj.material_slots[idx].material = dummy_mat
@@ -374,7 +457,7 @@ def bake_object_materials(
                     b_mat = orig_mat.copy()
                     temp_mats.append(b_mat)
                     _bypass_shader_to_rgb(b_mat.node_tree)
-                    _set_active_bake_image_node(b_mat, bake_images[orig_mat.name][1])
+                    _set_active_bake_image_node(b_mat, bake_images[orig_mat][1])
                     obj.material_slots[idx].material = b_mat
                 else:
                     obj.material_slots[idx].material = dummy_mat
@@ -386,10 +469,8 @@ def bake_object_materials(
                     b_mat = orig_mat.copy()
                     temp_mats.append(b_mat)
                     if _rewire_for_alpha_bake(b_mat):
-                        alpha_baked_mats.add(orig_mat.name)
-                        _set_active_bake_image_node(
-                            b_mat, bake_images[orig_mat.name][2]
-                        )
+                        alpha_baked_mats.add(orig_mat)
+                        _set_active_bake_image_node(b_mat, bake_images[orig_mat][2])
                     else:
                         _set_active_bake_image_node(b_mat, dummy_img)
                     obj.material_slots[idx].material = b_mat
@@ -400,7 +481,7 @@ def bake_object_materials(
 
         os.makedirs(cache_dir, exist_ok=True)
         for mat in target_mats:
-            base_img, emit_img, alpha_img = bake_images[mat.name]
+            base_img, emit_img, alpha_img = bake_images[mat]
             base_rgba = texture_utils.get_image_pixels_rgba(base_img)
             emit_rgba = texture_utils.get_image_pixels_rgba(emit_img)
 
@@ -413,22 +494,29 @@ def bake_object_materials(
                     base_rgba[:, :, :3] = np.clip(emit_rgba[:, :, :3], 0.0, 1.0)
                     is_pure_emit = True
 
-            if mat.name in alpha_baked_mats:
+            if mat in alpha_baked_mats and base_rgba is not None:
                 alpha_rgba = texture_utils.get_image_pixels_rgba(alpha_img)
                 if alpha_rgba is not None:
                     base_rgba[:, :, 3] = np.clip(alpha_rgba[:, :, 0], 0.0, 1.0)
 
-            base_img.pixels.foreach_set(base_rgba.ravel())
-            base_img.update()
+            if base_rgba is not None:
+                base_img.pixels.foreach_set(
+                    np.ascontiguousarray(base_rgba, dtype=np.float32).ravel()
+                )
+                base_img.update()
 
-            safe = "".join(c if c.isalnum() or c in "_-" else "_" for c in mat.name)[
-                :28
-            ]
+            safe = (
+                "".join(
+                    c if c.isascii() and (c.isalnum() or c in "_-") else "_"
+                    for c in mat.name
+                ).strip("_")[:24]
+                or "mat"
+            )
             tag = hashlib.md5(
                 f"{obj.name}|{mat.name}|{res}".encode("utf-8")
             ).hexdigest()[:8]
 
-            has_alpha = float(base_rgba[:, :, 3].min()) < 0.99
+            has_alpha = base_rgba is not None and float(base_rgba[:, :, 3].min()) < 0.99
             base_ext = ".png" if has_alpha else ".jpg"
             base_fmt = "PNG" if has_alpha else "JPEG"
 
@@ -464,11 +552,12 @@ def bake_object_materials(
                 except Exception:
                     pass
 
-            results[mat.name] = {
+            results[mat] = {
                 "base_img": saved_base,
                 "emit_img": saved_emit,
                 "has_emission": has_emission or is_pure_emit,
                 "is_pure_emit": is_pure_emit,
+                "uv_map": bake_uv_name if bake_uv_name != prev_render_uv else None,
             }
 
     except RuntimeError as e:
@@ -488,6 +577,12 @@ def bake_object_materials(
                 bpy.data.materials.remove(tm)
         if dummy_img.name in bpy.data.images:
             bpy.data.images.remove(dummy_img)
+
+        # 如果原本存在非 __BakeUV 的 UV 层，恢复为默认激活 UV，避免影响同物体未烘焙材质
+        if prev_active_uv and prev_active_uv in obj.data.uv_layers:
+            obj.data.uv_layers.active = obj.data.uv_layers[prev_active_uv]
+        if prev_render_uv and prev_render_uv in obj.data.uv_layers:
+            obj.data.uv_layers[prev_render_uv].active_render = True
 
         scene.render.engine = prev_engine
         scene.cycles.samples = prev_samples

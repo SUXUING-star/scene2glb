@@ -86,9 +86,6 @@ def _is_non_collider_material(mat: bpy.types.Material, obj_name: str) -> bool:
 
 
 def _strip_non_collider_geometry(obj: bpy.types.Object) -> tuple[bool, bool]:
-    """
-    返回值: (should_delete_object, stripped_any_faces)
-    """
     if obj.type != "MESH" or not obj.data or len(obj.data.polygons) == 0:
         return True, False
 
@@ -172,6 +169,7 @@ def _apply_lowpoly_decimate(
 ):
     if (
         not (0.05 <= decimate_ratio < 0.99)
+        or not obj.data
         or len(obj.data.polygons) <= collapse_min_faces
     ):
         return
@@ -181,7 +179,6 @@ def _apply_lowpoly_decimate(
             obj.active_shape_key_index = 0
             obj.shape_key_clear()
         else:
-            print(f"  [跳过减面] {obj.name} 含有形态键且设置了保留形态键")
             return
 
     protect_indices = _collect_protected_verts(
@@ -191,17 +188,19 @@ def _apply_lowpoly_decimate(
     if total_verts == 0 or len(protect_indices) >= total_verts * 0.85:
         return
 
-    vg = None
+    vg_name = "__LowPoly_Protect"
+    has_vg = False
     if protect_indices:
-        vg = obj.vertex_groups.new(name="__LowPoly_Protect")
+        vg = obj.vertex_groups.new(name=vg_name)
         vg.add(protect_indices, 1.0, "REPLACE")
+        has_vg = True
 
     mod = obj.modifiers.new(name="__LowPoly_Decimate", type="DECIMATE")
     mod.decimate_type = "COLLAPSE"
     mod.ratio = decimate_ratio
     mod.use_collapse_triangulate = True
-    if vg is not None and hasattr(mod, "vertex_group"):
-        mod.vertex_group = vg.name
+    if has_vg and hasattr(mod, "vertex_group"):
+        mod.vertex_group = vg_name
         mod.invert_vertex_group = True
         if hasattr(mod, "vertex_group_factor"):
             mod.vertex_group_factor = 1.0
@@ -210,11 +209,30 @@ def _apply_lowpoly_decimate(
         obj.modifiers.move(len(obj.modifiers) - 1, 0)
 
     scene_utils.ensure_object_visible_and_linked(obj)
-    with bpy.context.temp_override(object=obj, active_object=obj):
-        bpy.ops.object.modifier_apply(modifier=mod.name)
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
 
-    if vg is not None and vg.name in obj.vertex_groups:
-        obj.vertex_groups.remove(vg)
+    with bpy.context.temp_override(
+        active_object=obj,
+        object=obj,
+        selected_objects=[obj],
+        selected_editable_objects=[obj],
+    ):
+        try:
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        except Exception:
+            if mod.name in obj.modifiers:
+                obj.modifiers.remove(mod)
+
+    # 重新从当前对象动态查找顶点组对象，避免使用失效的旧指针抛出 DeformGroup not in object
+    if has_vg:
+        g = obj.vertex_groups.get(vg_name)
+        if g is not None:
+            try:
+                obj.vertex_groups.remove(g)
+            except Exception:
+                pass
 
 
 def run(config: dict, root_obj: bpy.types.Object, cache_dir: str):
@@ -330,7 +348,7 @@ def run(config: dict, root_obj: bpy.types.Object, cache_dir: str):
             sharp_angle_deg=sharp_angle_deg,
         )
 
-    for obj in objects_to_delete:
+    for obj in reversed(objects_to_delete):
         if obj.name in bpy.data.objects:
             bpy.data.objects.remove(obj, do_unlink=True)
 
